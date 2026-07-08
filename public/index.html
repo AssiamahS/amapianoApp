@@ -206,6 +206,7 @@ body{background:#0a0a0a;color:#f0f0f0;font-family:-apple-system,BlinkMacSystemFo
   <div class="search-box"><input type="text" id="searchInput" placeholder="Search songs, artists... (#tag)" oninput="debounceSearch()"></div>
   <span class="stats" id="statsText">Loading...</span>
   <button class="auto-tag-btn" id="autoTagBtn" onclick="autoTagGenres()" title="Spotify Auto-Tag" style="width:30px;height:30px;display:flex;align-items:center;justify-content:center;padding:0"><svg width="14" height="14" viewBox="0 0 24 24" fill="#1db954"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg></button>
+  <button class="shazam-btn" id="shazamBtn" onclick="openShazam()" title="Shazam — identify playing song" style="width:30px;height:30px;display:flex;align-items:center;justify-content:center;padding:0;background:#0088ff;border:none;border-radius:6px;cursor:pointer;margin-left:4px"><svg width="14" height="14" viewBox="0 0 24 24" fill="#fff"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14.5V12H8l4-7v4.5h3l-4 7z"/></svg></button>
   <button class="scan-btn" id="scanBtn" onclick="scanLibrary()">Scan</button>
 </div>
 
@@ -226,6 +227,8 @@ body{background:#0a0a0a;color:#f0f0f0;font-family:-apple-system,BlinkMacSystemFo
     <summary style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:.5px;cursor:pointer;padding:12px 8px 8px;user-select:none;list-style:none;display:flex;align-items:center;gap:6px"><span class="serato-arrow" style="font-size:8px;transition:transform .2s">▶</span> Serato Crates</summary>
     <div id="seratoCrates"></div>
   </details>
+
+  <div class="new-pl" onclick="openPage('/usb')" title="Prepare a USB stick for Serato + rekordbox">⇪ USB Export</div>
 </div>
 
 <div class="filterbar" id="filterBar"></div>
@@ -772,6 +775,147 @@ function formatTime(s){if(!s||isNaN(s))return"0:00";const m=Math.floor(s/60);con
 function esc(s){if(!s)return"";const d=document.createElement("div");d.textContent=s;return d.innerHTML}
 
 init();
+</script>
+
+<!-- Shazam modal -->
+<div id="shazamModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:9999;align-items:center;justify-content:center">
+  <div style="background:#111;border-radius:16px;padding:28px;width:min(420px,92vw);border:1px solid #222;color:#eee;text-align:center;position:relative">
+    <button onclick="closeShazam()" style="position:absolute;top:10px;right:10px;background:none;border:none;color:#888;font-size:22px;cursor:pointer">×</button>
+    <h2 style="margin-bottom:6px;font-size:20px">Shazam</h2>
+    <p style="color:#888;font-size:12px;margin-bottom:20px">Identify the song currently playing</p>
+    <div id="shazamIdle">
+      <button id="shazamStart" onclick="startShazam()" style="width:120px;height:120px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#0099ff,#0066cc);border:none;color:#fff;font-size:48px;cursor:pointer;box-shadow:0 0 30px rgba(0,153,255,.5)">🎤</button>
+      <p style="margin-top:16px;font-size:13px;color:#aaa">Tap to listen (6 sec)</p>
+    </div>
+    <div id="shazamRecording" style="display:none">
+      <div style="width:120px;height:120px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#ff3366,#cc0044);margin:0 auto;display:flex;align-items:center;justify-content:center;font-size:48px;animation:shazamPulse 1s infinite">🎧</div>
+      <p id="shazamTimer" style="margin-top:16px;font-size:14px;color:#ff6699;font-weight:600">Listening... 6s</p>
+    </div>
+    <div id="shazamResult" style="display:none"></div>
+    <div id="shazamError" style="display:none;color:#f66;font-size:13px;margin-top:12px"></div>
+  </div>
+</div>
+<style>
+@keyframes shazamPulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.08)} }
+</style>
+<script>
+let shazamRecorder=null, shazamChunks=[], shazamStream=null, shazamTimerInterval=null;
+
+function openShazam(){
+  document.getElementById('shazamModal').style.display='flex';
+  document.getElementById('shazamIdle').style.display='block';
+  document.getElementById('shazamRecording').style.display='none';
+  document.getElementById('shazamResult').style.display='none';
+  document.getElementById('shazamError').style.display='none';
+}
+function closeShazam(){
+  stopShazamStream();
+  document.getElementById('shazamModal').style.display='none';
+}
+function stopShazamStream(){
+  if(shazamRecorder && shazamRecorder.state!=='inactive') shazamRecorder.stop();
+  if(shazamStream) shazamStream.getTracks().forEach(t=>t.stop());
+  if(shazamTimerInterval) clearInterval(shazamTimerInterval);
+  shazamRecorder=null; shazamStream=null; shazamTimerInterval=null;
+}
+async function startShazam(){
+  const errEl=document.getElementById('shazamError');
+  errEl.style.display='none';
+  try{
+    shazamStream = await navigator.mediaDevices.getUserMedia({audio:true});
+  }catch(e){
+    errEl.textContent = 'Mic permission denied. Allow microphone access in Safari settings.';
+    errEl.style.display='block';
+    return;
+  }
+  document.getElementById('shazamIdle').style.display='none';
+  document.getElementById('shazamRecording').style.display='block';
+  shazamChunks=[];
+  const mime = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : (MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : '');
+  shazamRecorder = new MediaRecorder(shazamStream, mime?{mimeType:mime}:undefined);
+  shazamRecorder.ondataavailable = e=>{ if(e.data.size>0) shazamChunks.push(e.data); };
+  shazamRecorder.onstop = ()=> uploadShazam(mime);
+  shazamRecorder.start();
+  let remaining=6;
+  document.getElementById('shazamTimer').textContent=`Listening... ${remaining}s`;
+  shazamTimerInterval = setInterval(()=>{
+    remaining--;
+    document.getElementById('shazamTimer').textContent = remaining>0 ? `Listening... ${remaining}s` : 'Matching...';
+    if(remaining<=0){
+      clearInterval(shazamTimerInterval);
+      shazamTimerInterval=null;
+      if(shazamRecorder && shazamRecorder.state==='recording') shazamRecorder.stop();
+    }
+  },1000);
+}
+async function uploadShazam(mime){
+  const blob = new Blob(shazamChunks, {type: mime||'audio/webm'});
+  if(shazamStream){ shazamStream.getTracks().forEach(t=>t.stop()); shazamStream=null; }
+  const fd = new FormData();
+  fd.append('audio', blob, 'clip.' + ((mime||'').includes('mp4')?'mp4':'webm'));
+  try{
+    const r = await fetch('/api/shazam', {method:'POST', body:fd});
+    const d = await r.json();
+    if(!r.ok){ showShazamError(d.error||'Unknown error'); return; }
+    if(!d.matched){ showShazamError("Couldn't identify — try again with the song playing louder."); return; }
+    renderShazamResult(d);
+  }catch(e){
+    showShazamError('Network error: '+e.message);
+  }
+}
+function showShazamError(msg){
+  document.getElementById('shazamRecording').style.display='none';
+  document.getElementById('shazamIdle').style.display='block';
+  const errEl=document.getElementById('shazamError');
+  errEl.textContent = msg;
+  errEl.style.display='block';
+}
+function renderShazamResult(d){
+  document.getElementById('shazamRecording').style.display='none';
+  const link = d.spotify_url || d.apple_url || '';
+  const linkLabel = d.spotify_url ? 'Copy Spotify Link' : (d.apple_url ? 'Copy Apple Music Link' : 'No Link');
+  const dlDisabled = d.spotify_url ? '' : 'disabled';
+  const res = document.getElementById('shazamResult');
+  res.innerHTML = `
+    ${d.cover?`<img src="${d.cover}" style="width:140px;height:140px;border-radius:10px;margin-bottom:12px;object-fit:cover">`:''}
+    <div style="font-size:18px;font-weight:700;margin-bottom:4px">${esc(d.title||'Unknown')}</div>
+    <div style="font-size:13px;color:#aaa;margin-bottom:4px">${esc(d.artist||'')}</div>
+    ${d.album?`<div style="font-size:11px;color:#666;margin-bottom:16px">${esc(d.album)}</div>`:'<div style="margin-bottom:16px"></div>'}
+    <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+      <button onclick="shazamCopyLink('${(link||'').replace(/'/g,"\\'")}')" ${link?'':'disabled'} style="background:#0088ff;color:#fff;border:none;border-radius:8px;padding:10px 16px;font-size:13px;font-weight:600;cursor:pointer">${linkLabel}</button>
+      <button onclick="shazamSendDownload('${(d.spotify_url||'').replace(/'/g,"\\'")}')" ${dlDisabled} style="background:#ff5500;color:#fff;border:none;border-radius:8px;padding:10px 16px;font-size:13px;font-weight:600;cursor:pointer">Send to Download</button>
+    </div>
+    <button onclick="openShazam()" style="margin-top:14px;background:none;border:1px solid #333;color:#888;border-radius:8px;padding:8px 14px;font-size:12px;cursor:pointer">Try Again</button>
+  `;
+  res.style.display='block';
+  function esc(s){return String(s).replace(/[&<>"']/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));}
+  window._shazamEsc = esc;
+}
+async function shazamCopyLink(url){
+  if(!url) return;
+  try{
+    await navigator.clipboard.writeText(url);
+    const btns = document.querySelectorAll('#shazamResult button');
+    if(btns[0]){ const orig=btns[0].textContent; btns[0].textContent='Copied ✓'; setTimeout(()=>btns[0].textContent=orig,1500); }
+  }catch(e){
+    prompt('Copy link:', url);
+  }
+}
+function openPage(url){
+  // window.open('_blank') is silently ignored in the desktop app's WKWebView — navigate in place there
+  const w=window.open(url,'_blank');
+  if(!w) location.href=url;
+}
+async function shazamSendDownload(spotifyUrl){
+  if(!spotifyUrl) return;
+  try{
+    await fetch('/api/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:spotifyUrl,name:''})});
+    openPage('/downloads');
+    closeShazam();
+  }catch(e){
+    alert('Download failed: '+e.message);
+  }
+}
 </script>
 
 </body>

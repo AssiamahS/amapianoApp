@@ -5,3 +5,7 @@ uploads/
 library.json
 *.pyc
 .claude/worktrees/
+NOTES.md
+graphify-out/
+mcp-browser/screenshots/
+.DS_Store

@@ -8,6 +8,8 @@ import hashlib
 import struct
 import time
 import base64
+import subprocess
+import threading
 import urllib.request
 import urllib.parse
 from pathlib import Path
@@ -35,9 +37,10 @@ MOBILE_DIR = Path(__file__).parent.parent / "amapiano-iphone"
 SERATO_DIR = Path.home() / "Music" / "_Serato_" / "Subcrates"
 SERATO_BACKUP = Path.home() / "Music" / "_Serato_Backup" / "Subcrates"
 
-# Spotify credentials from spotdl
-SPOTIFY_ID = "50509b8c6608434fbb2c86dd8cfdaf90"
-SPOTIFY_SECRET = "36bb45f66ab447fe971a17cafb48dbeb"
+# Spotify credentials: env override, else spotdl's public client pair
+# (the old hardcoded app was deleted upstream and returns invalid_client)
+SPOTIFY_ID = os.environ.get("SPOTIFY_ID", "5f573c9620494bae87890c0f08a60293")
+SPOTIFY_SECRET = os.environ.get("SPOTIFY_SECRET", "212476d9b0f3472eaa762d90b19b0ba8")
 _spotify_token = {"token": None, "expires": 0}
 
 
@@ -114,6 +117,89 @@ def classify_title(title):
     if "visualizer" in tl:
         flags.append("visualizer")
     return flags
+
+
+# ── Sanitation: audio_only > lyric_video > music_video > live ──
+_SANITIZE_MUSIC_VIDEO_PATTERNS = [
+    r'\bofficial\s*music\s*video\b',
+    r'\bmusic\s*video\b',
+    r'\bofficial\s*video\b',
+    r'\[\s*video\s*\]',
+    r'\(\s*video\s*\)',
+    r'\bofficial\s*hd\s*video\b',
+    r'\bhd\s*video\b',
+    r'\bofficial\s*mv\b',
+    r'\bmusic\s*vid\b',
+    r'\bdance\s*video\b',
+    r'\bvertical\s*video\b',
+]
+_SANITIZE_LIVE_PATTERNS = [
+    r'\blive\s*at\b',
+    r'\blive\s*performance\b',
+    r'\blive\s*session\b',
+    r'\bconcert\b',
+    r'\bfestival\b',
+    r'\btiny\s*desk\b',
+    r'\bunplugged\b',
+    r'\bacoustic\s*version\b',
+    r'\blive\s*on\b',
+    r'\bcolors\s*show\b',
+]
+_SANITIZE_LYRIC_PATTERNS = [
+    r'\blyric\s*video\b',
+    r'\(lyrics\)',
+    r'\[lyrics\]',
+    r'\blyrics\b',
+    r'\bvisualizer\b',
+    r'\bvisualiser\b',
+    r'\blyric\s*visualizer\b',
+]
+_SANITIZE_AUDIO_PATTERNS = [
+    r'\bofficial\s*audio\b',
+    r'\(audio\)',
+    r'\[audio\]',
+    r'- topic\b',
+    r'\baudio\s*only\b',
+    r'\bofficial\s*album\s*audio\b',
+]
+
+
+def sanitize_classify(title):
+    """Classify track source: audio_only | lyric_video | music_video | live | unknown."""
+    if not title:
+        return 'unknown'
+    t = title.lower()
+    for p in _SANITIZE_MUSIC_VIDEO_PATTERNS:
+        if re.search(p, t):
+            return 'music_video'
+    for p in _SANITIZE_LIVE_PATTERNS:
+        if re.search(p, t):
+            return 'live'
+    for p in _SANITIZE_LYRIC_PATTERNS:
+        if re.search(p, t):
+            return 'lyric_video'
+    for p in _SANITIZE_AUDIO_PATTERNS:
+        if re.search(p, t):
+            return 'audio_only'
+    return 'unknown'
+
+
+def sanitize_clean_title(title):
+    """Strip video/audio/lyric suffixes from a title to improve YouTube search matching."""
+    # Remove anything in brackets/parens that contains video/audio/lyric keywords
+    patterns_to_strip = [
+        r'\s*[\[\(][^\]\)]*(?:official|music|lyric|audio|video|mv|hd|visualizer|visualiser|vertical|dance)[^\]\)]*[\]\)]\s*',
+        r'\s*-?\s*official\s*(?:music\s*)?video\s*$',
+        r'\s*-?\s*official\s*audio\s*$',
+        r'\s*-?\s*lyric\s*video\s*$',
+        r'\s*-?\s*lyrics\s*$',
+        r'\s*-?\s*visualizer\s*$',
+        r'\s*-?\s*audio\s*$',
+    ]
+    cleaned = title
+    for p in patterns_to_strip:
+        cleaned = re.sub(p, '', cleaned, flags=re.IGNORECASE)
+    return cleaned.strip(' -|·')
 
 
 def extract_cover(filepath, fid):
@@ -348,6 +434,129 @@ function esc(s){return s?s.replace(/&/g,'&amp;').replace(/</g,'&lt;'):''}
 poll();
 polling=setInterval(poll,3000);
 </script></body></html>"""
+
+
+def _try_audd(audio_bytes, mime):
+    key = os.environ.get("AUDD_API_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        import requests as _rq
+        resp = _rq.post(
+            "https://api.audd.io/",
+            data={"api_token": key, "return": "spotify,apple_music"},
+            files={"file": ("clip", audio_bytes, mime or "audio/webm")},
+            timeout=20,
+        )
+        data = resp.json()
+    except Exception as e:
+        print(f"[shazam] AudD error: {e}")
+        return None
+    if data.get("status") != "success" or not data.get("result"):
+        return None
+    r = data["result"]
+    sp = r.get("spotify") or {}
+    am = r.get("apple_music") or {}
+    cover = None
+    try:
+        cover = (sp.get("album") or {}).get("images", [{}])[0].get("url")
+    except Exception:
+        pass
+    if not cover:
+        art = am.get("artwork") or {}
+        cover = (art.get("url") or "").replace("{w}", "300").replace("{h}", "300")
+    return {
+        "source": "audd",
+        "title": r.get("title"),
+        "artist": r.get("artist"),
+        "album": r.get("album"),
+        "release_date": r.get("release_date"),
+        "spotify_url": (sp.get("external_urls") or {}).get("spotify"),
+        "apple_url": am.get("url") or r.get("song_link"),
+        "cover": cover,
+    }
+
+
+def _try_rapidapi_shazam(audio_bytes, mime):
+    key = os.environ.get("RAPIDAPI_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        import requests as _rq
+        resp = _rq.post(
+            "https://shazam-core.p.rapidapi.com/v1/tracks/recognize",
+            headers={
+                "X-RapidAPI-Key": key,
+                "X-RapidAPI-Host": "shazam-core.p.rapidapi.com",
+            },
+            files={"upload_file": ("clip", audio_bytes, mime or "audio/webm")},
+            timeout=25,
+        )
+        if resp.status_code != 200:
+            print(f"[shazam] RapidAPI HTTP {resp.status_code}: {resp.text[:200]}")
+            return None
+        data = resp.json()
+    except Exception as e:
+        print(f"[shazam] RapidAPI error: {e}")
+        return None
+    t = data.get("track")
+    if not t and data.get("matches"):
+        t = data["matches"][0]
+    if not t:
+        return None
+    cover = (t.get("images") or {}).get("coverart") or (t.get("images") or {}).get("background")
+    spotify_url = None
+    apple_url = None
+    for action in ((t.get("hub") or {}).get("actions") or []):
+        uri = action.get("uri", "")
+        if "spotify" in uri and not spotify_url:
+            spotify_url = uri
+        elif "music.apple.com" in uri and not apple_url:
+            apple_url = uri
+    if not apple_url:
+        apple_url = (t.get("share") or {}).get("href")
+    return {
+        "source": "rapidapi",
+        "title": t.get("title"),
+        "artist": t.get("subtitle"),
+        "album": None,
+        "cover": cover,
+        "spotify_url": spotify_url,
+        "apple_url": apple_url,
+    }
+
+
+@app.route("/api/shazam", methods=["POST"])
+def shazam_match():
+    """Recognize a short audio clip. Tries AudD first, falls back to RapidAPI Shazam."""
+    if "audio" not in request.files:
+        return jsonify({"error": "No audio uploaded"}), 400
+    audio_file = request.files["audio"]
+    audio_bytes = audio_file.read()
+    if not audio_bytes:
+        return jsonify({"error": "Empty audio clip"}), 400
+    mime = audio_file.mimetype
+    print(f"[shazam] Received {len(audio_bytes)} bytes, mime={mime}")
+    try:
+        import requests  # noqa: F401 - availability check
+    except ImportError:
+        return jsonify({"error": "Missing 'requests' — run: pip install requests"}), 500
+    result = _try_audd(audio_bytes, mime)
+    if result:
+        print(f"[shazam] AudD matched: {result.get('title')} — {result.get('artist')}")
+    else:
+        print("[shazam] AudD no match, trying RapidAPI...")
+        result = _try_rapidapi_shazam(audio_bytes, mime)
+        if result:
+            print(f"[shazam] RapidAPI matched: {result.get('title')} — {result.get('artist')}")
+        else:
+            print("[shazam] RapidAPI no match either")
+    if not result:
+        if not os.environ.get("AUDD_API_KEY") and not os.environ.get("RAPIDAPI_KEY"):
+            return jsonify({"error": "No Shazam backend configured. Set AUDD_API_KEY or RAPIDAPI_KEY."}), 400
+        return jsonify({"matched": False, "message": "No match found (tried AudD + RapidAPI)", "bytes_received": len(audio_bytes)})
+    result["matched"] = True
+    return jsonify(result)
 
 
 @app.route("/mobile")
@@ -826,6 +1035,790 @@ def create_crate():
     return jsonify({"created": True, "name": name})
 
 
+# ── Rekordbox XML export ──
+
+REKORDBOX_XML = Path.home() / "Music" / "rekordbox-amapiano.xml"
+REKORDBOX_KINDS = {
+    ".mp3": "MP3 File", ".m4a": "M4A File", ".aac": "AAC File",
+    ".wav": "WAV File", ".flac": "FLAC File", ".ogg": "OGG File", ".opus": "OGG File",
+}
+
+
+def _build_rekordbox_xml(groups, output_path):
+    """Write a rekordbox-importable XML (DJ_PLAYLISTS 1.0.0).
+
+    groups = [{"name": folder_name_or_None, "playlists": [{"name": str, "tracks": [track dicts]}]}]
+    A group with name None puts its playlists at the root level.
+    """
+    import xml.etree.ElementTree as ET
+
+    root = ET.Element("DJ_PLAYLISTS", Version="1.0.0")
+    ET.SubElement(root, "PRODUCT", Name="rekordbox", Version="6.0.0", Company="AlphaTheta")
+
+    collection = ET.SubElement(root, "COLLECTION")
+    track_keys = {}  # file path -> TrackID
+    for group in groups:
+        for pl in group["playlists"]:
+            for t in pl["tracks"]:
+                path = t["path"]
+                if path in track_keys or not os.path.exists(path):
+                    continue
+                tid = str(len(track_keys) + 1)
+                track_keys[path] = tid
+                ET.SubElement(collection, "TRACK", {
+                    "TrackID": tid,
+                    "Name": t.get("title") or Path(path).stem,
+                    "Artist": t.get("artist") or "",
+                    "Album": t.get("album") or "",
+                    "Genre": t.get("genre") or "",
+                    "Kind": REKORDBOX_KINDS.get(Path(path).suffix.lower(), "MP3 File"),
+                    "Size": str(t.get("file_size") or 0),
+                    "TotalTime": str(int(t.get("duration") or 0)),
+                    "Location": "file://localhost" + urllib.parse.quote(path),
+                })
+    collection.set("Entries", str(len(track_keys)))
+
+    playlists_el = ET.SubElement(root, "PLAYLISTS")
+    root_node = ET.SubElement(playlists_el, "NODE", Type="0", Name="ROOT")
+
+    def _add_playlist_node(parent, pl):
+        keys = []
+        seen = set()
+        for t in pl["tracks"]:
+            k = track_keys.get(t["path"])
+            if k and k not in seen:
+                seen.add(k)
+                keys.append(k)
+        node = ET.SubElement(parent, "NODE", Name=pl["name"], Type="1",
+                             KeyType="0", Entries=str(len(keys)))
+        for k in keys:
+            ET.SubElement(node, "TRACK", Key=k)
+
+    for group in groups:
+        if group.get("name"):
+            folder = ET.SubElement(root_node, "NODE", Type="0", Name=group["name"],
+                                   Count=str(len(group["playlists"])))
+            for pl in group["playlists"]:
+                _add_playlist_node(folder, pl)
+        else:
+            for pl in group["playlists"]:
+                _add_playlist_node(root_node, pl)
+    root_node.set("Count", str(len(list(root_node))))
+
+    if hasattr(ET, "indent"):
+        ET.indent(root)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(ET.tostring(root, encoding="utf-8", xml_declaration=True))
+    return {"tracks": len(track_keys), "playlists": sum(len(g["playlists"]) for g in groups)}
+
+
+def _crate_tracks_for_export(crate_path, db):
+    """Resolve a Serato crate's file paths to track dicts (stub for files not in the db)."""
+    tracks = []
+    for fp in parse_serato_crate(crate_path):
+        t = db["tracks"].get(file_id(fp))
+        if t:
+            tracks.append(t)
+        elif os.path.exists(fp):
+            tracks.append({"path": fp, "title": Path(fp).stem, "artist": "",
+                           "album": "", "genre": "", "duration": 0, "file_size": 0})
+    return tracks
+
+
+def _export_all_rekordbox(output_path=None):
+    """Export every playlist and every live Serato crate into one rekordbox XML."""
+    db = load_db()
+
+    app_pls = []
+    for pl in db.get("playlists", {}).values():
+        tracks = [db["tracks"][tid] for tid in pl.get("track_ids", []) if tid in db["tracks"]]
+        if tracks:
+            app_pls.append({"name": pl["name"], "tracks": tracks})
+
+    crate_pls = []
+    if SERATO_DIR.exists():
+        for f in sorted(SERATO_DIR.glob("*.crate")):
+            tracks = _crate_tracks_for_export(f, db)
+            if tracks:
+                crate_pls.append({"name": f.stem.replace("%%", " > "), "tracks": tracks})
+
+    groups = []
+    if app_pls:
+        groups.append({"name": "Playlists", "playlists": app_pls})
+    if crate_pls:
+        groups.append({"name": "Serato Crates", "playlists": crate_pls})
+
+    dest = Path(output_path) if output_path else REKORDBOX_XML
+    stats = _build_rekordbox_xml(groups, dest)
+    return {"path": str(dest), **stats}
+
+
+@app.route("/api/rekordbox/export", methods=["POST"])
+def export_to_rekordbox():
+    """Export a playlist, a Serato crate, or the whole library as rekordbox XML."""
+    data = request.json or {}
+    output_path = data.get("output_path")
+    db = load_db()
+
+    if data.get("playlist_id"):
+        pl = db.get("playlists", {}).get(data["playlist_id"])
+        if not pl:
+            return jsonify({"error": "Playlist not found"}), 404
+        tracks = [db["tracks"][tid] for tid in pl.get("track_ids", []) if tid in db["tracks"]]
+        name = pl["name"].replace("[Serato] ", "")
+        safe = re.sub(r"[^\w\s\-]", "", name).strip() or "playlist"
+        dest = Path(output_path) if output_path else Path.home() / "Music" / f"rekordbox-{safe}.xml"
+        stats = _build_rekordbox_xml([{"name": None, "playlists": [{"name": name, "tracks": tracks}]}], dest)
+        return jsonify({"exported": True, "path": str(dest), **stats})
+
+    if data.get("crate_name"):
+        real_name = data["crate_name"].replace(" > ", "%%")
+        crate_path = SERATO_DIR / f"{real_name}.crate"
+        if not crate_path.exists():
+            return jsonify({"error": "Crate not found"}), 404
+        tracks = _crate_tracks_for_export(crate_path, db)
+        name = data["crate_name"]
+        safe = re.sub(r"[^\w\s\-]", "", name).strip() or "crate"
+        dest = Path(output_path) if output_path else Path.home() / "Music" / f"rekordbox-{safe}.xml"
+        stats = _build_rekordbox_xml([{"name": None, "playlists": [{"name": name, "tracks": tracks}]}], dest)
+        return jsonify({"exported": True, "path": str(dest), **stats})
+
+    return jsonify({"exported": True, **_export_all_rekordbox(output_path)})
+
+
+# ── USB export: prepare a stick for Serato + rekordbox in one shot ──
+
+_usb_jobs = {}
+_usb_lock = threading.Lock()
+
+_FAT32_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
+
+
+def _fat32_safe(name):
+    return (_FAT32_BAD.sub("_", name).strip().rstrip(". ") or "untitled")[:120]
+
+
+def _serato_field(tag, payload):
+    return tag + struct.pack(">I", len(payload)) + payload
+
+
+def _write_usb_serato_database(usb_root, rel_paths):
+    """Write minimal _Serato_/database V2 — without it Serato won't mount the drive's crates."""
+    buf = bytearray()
+    buf += _serato_field(b"vrsn", "2.0/Serato Scratch LiveDatabase".encode("utf-16-be"))
+    for rel in rel_paths:
+        ext = Path(rel).suffix.lstrip(".").lower() or "mp3"
+        inner = _serato_field(b"ttyp", ext.encode("utf-16-be"))
+        inner += _serato_field(b"pfil", rel.encode("utf-16-be"))
+        buf += _serato_field(b"otrk", inner)
+    serato_dir = usb_root / "_Serato_"
+    serato_dir.mkdir(exist_ok=True)
+    (serato_dir / "database V2").write_bytes(bytes(buf))
+
+
+def _write_usb_crate(usb_root, name, rel_paths):
+    """Write a Serato .crate on the stick with volume-relative paths."""
+    buf = bytearray()
+    buf += _serato_field(b"vrsn", "1.0/Serato ScratchLive Crate".encode("utf-16-be"))
+    for rel in rel_paths:
+        pb = rel.encode("utf-16-be")
+        buf += b"otrk" + struct.pack(">I", len(pb) + 8)
+        buf += _serato_field(b"ptrk", pb)
+    subcrates = usb_root / "_Serato_" / "Subcrates"
+    subcrates.mkdir(parents=True, exist_ok=True)
+    crate_file = _fat32_safe(name.replace(" > ", "%%")) + ".crate"
+    (subcrates / crate_file).write_bytes(bytes(buf))
+
+
+def _clean_appledouble(root):
+    """Delete macOS ._ ghost files + .DS_Store — they make USB folders look empty/broken on players."""
+    removed = 0
+    for dirpath, _dirs, files in os.walk(str(root)):
+        for f in files:
+            if f.startswith("._") or f == ".DS_Store":
+                try:
+                    os.remove(os.path.join(dirpath, f))
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
+def _usb_prepare_worker(job_id, usb_root, selections):
+    """Copy tracks + write Serato crates/database + rekordbox XML onto the stick."""
+    job = _usb_jobs[job_id]
+    try:
+        music_root = usb_root / "Music"
+        src_to_rel = {}   # source path -> USB-relative path (dedupe across playlists)
+        plan = []         # (selection_name, [track dicts])
+
+        for sel in selections:
+            plan.append((sel["name"], sel["tracks"]))
+
+        # Preflight: bytes that actually need copying vs free space
+        to_copy = 0
+        seen = set()
+        for _name, tracks in plan:
+            for t in tracks:
+                src = t["path"]
+                if src in seen or not os.path.exists(src):
+                    continue
+                seen.add(src)
+                folder = music_root / _fat32_safe(_name)
+                dest = folder / _fat32_safe(Path(src).name)
+                if not (dest.exists() and dest.stat().st_size == os.path.getsize(src)):
+                    to_copy += os.path.getsize(src)
+        free = __import__("shutil").disk_usage(str(usb_root)).free
+        if to_copy > free - 100 * 1024 * 1024:
+            job["status"] = "error"
+            job["error"] = f"Not enough space: need {to_copy // (1024*1024)} MB, only {free // (1024*1024)} MB free"
+            return
+
+        job["bytes_total"] = to_copy
+        job["total_files"] = len(seen)
+        job["status"] = "copying"
+
+        import shutil
+        for sel_name, tracks in plan:
+            folder_name = _fat32_safe(sel_name)
+            folder = music_root / folder_name
+            for t in tracks:
+                src = t["path"]
+                if src in src_to_rel or not os.path.exists(src):
+                    continue
+                folder.mkdir(parents=True, exist_ok=True)
+                fname = _fat32_safe(Path(src).name)
+                dest = folder / fname
+                size = os.path.getsize(src)
+                if dest.exists() and dest.stat().st_size == size:
+                    job["skipped"] += 1
+                else:
+                    # copyfile (not copy2): metadata copy on FAT32 spawns ._ AppleDouble ghosts
+                    shutil.copyfile(src, dest)
+                    job["bytes_done"] += size
+                src_to_rel[src] = f"Music/{folder_name}/{fname}"
+                job["copied"] += 1
+                job["current"] = f"{t.get('artist', '')} - {t.get('title', fname)}"
+
+        job["status"] = "writing"
+
+        # Serato: one crate per selection + database V2 over everything
+        for sel_name, tracks in plan:
+            rels = [src_to_rel[t["path"]] for t in tracks if t["path"] in src_to_rel]
+            if rels:
+                _write_usb_crate(usb_root, sel_name, rels)
+        _write_usb_serato_database(usb_root, sorted(set(src_to_rel.values())))
+
+        # rekordbox: XML on the stick, locations pointing at the stick
+        rb_groups = []
+        rb_pls = []
+        for sel_name, tracks in plan:
+            rb_tracks = []
+            for t in tracks:
+                rel = src_to_rel.get(t["path"])
+                if rel:
+                    rb_tracks.append({**t, "path": str(usb_root / rel)})
+            if rb_tracks:
+                rb_pls.append({"name": sel_name, "tracks": rb_tracks})
+        if rb_pls:
+            rb_groups.append({"name": None, "playlists": rb_pls})
+            _build_rekordbox_xml(rb_groups, usb_root / "rekordbox-import.xml")
+
+        job["ghosts_removed"] = _clean_appledouble(music_root) + _clean_appledouble(usb_root / "_Serato_")
+        job["crates"] = len(plan)
+        job["status"] = "done"
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)
+
+
+@app.route("/api/usb/volumes")
+def usb_volumes():
+    """List writable external volumes."""
+    vols = []
+    volumes_dir = Path("/Volumes")
+    for v in sorted(volumes_dir.iterdir()):
+        if v.is_symlink() or not v.is_dir():
+            continue
+        if not os.path.ismount(str(v)) or not os.access(str(v), os.W_OK):
+            continue
+        try:
+            import shutil
+            du = shutil.disk_usage(str(v))
+            vols.append({"name": v.name, "path": str(v), "free_mb": du.free // (1024 * 1024),
+                         "total_mb": du.total // (1024 * 1024),
+                         "has_serato": (v / "_Serato_").exists()})
+        except OSError:
+            continue
+    return jsonify({"volumes": vols})
+
+
+@app.route("/api/usb/prepare", methods=["POST"])
+def usb_prepare():
+    """Prepare a USB stick: copy selected playlists/crates, write Serato database V2 +
+    crates and a rekordbox XML. Body: {volume, playlist_ids: [], crate_names: []}."""
+    data = request.json or {}
+    volume = data.get("volume", "")
+    usb_root = Path(volume)
+    if not data.get("_test_dir") and (not volume.startswith("/Volumes/") or not os.path.ismount(volume)):
+        return jsonify({"error": "volume must be a mounted drive under /Volumes"}), 400
+    if not usb_root.exists() or not os.access(str(usb_root), os.W_OK):
+        return jsonify({"error": "volume not found or not writable"}), 400
+
+    db = load_db()
+    selections = []
+    for pid in data.get("playlist_ids", []):
+        pl = db.get("playlists", {}).get(pid)
+        if not pl:
+            return jsonify({"error": f"playlist not found: {pid}"}), 404
+        tracks = [db["tracks"][tid] for tid in pl.get("track_ids", []) if tid in db["tracks"]]
+        if tracks:
+            selections.append({"name": pl["name"].replace("[Serato] ", ""), "tracks": tracks})
+    for cname in data.get("crate_names", []):
+        crate_path = SERATO_DIR / (cname.replace(" > ", "%%") + ".crate")
+        if not crate_path.exists():
+            return jsonify({"error": f"crate not found: {cname}"}), 404
+        tracks = _crate_tracks_for_export(crate_path, db)
+        if tracks:
+            selections.append({"name": cname, "tracks": tracks})
+    if not selections:
+        return jsonify({"error": "nothing selected (or all selections are empty)"}), 400
+
+    job_id = hashlib.md5(f"{volume}{time.time()}".encode()).hexdigest()[:10]
+    with _usb_lock:
+        _usb_jobs[job_id] = {"id": job_id, "status": "starting", "volume": volume,
+                             "copied": 0, "skipped": 0, "total_files": 0,
+                             "bytes_done": 0, "bytes_total": 0, "current": "",
+                             "crates": 0, "error": None}
+    t = threading.Thread(target=_usb_prepare_worker, args=(job_id, usb_root, selections), daemon=True)
+    t.start()
+    return jsonify({"job_id": job_id, "selections": len(selections),
+                    "tracks": sum(len(s["tracks"]) for s in selections)})
+
+
+@app.route("/api/usb/jobs/<job_id>")
+def usb_job_status(job_id):
+    job = _usb_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+    return jsonify(job)
+
+
+# ── rekordbox device-export database (.pdb) parser ──
+# Format is reverse-engineered (Deep Symmetry's rekordbox_pdb analysis).
+# We only read what the converter needs: tracks (title + file path) and playlists.
+
+_PDB_TRACKS, _PDB_PLAYLIST_TREE, _PDB_PLAYLIST_ENTRIES = 0, 5, 6
+
+
+def _pdb_string(data, pos):
+    """Read a DeviceSQL string. Short: 1 header byte, ascii. Long: kind, u2 len, pad, data."""
+    kind = data[pos]
+    if kind & 1:
+        n = (kind >> 1) - 1
+        return data[pos + 1 : pos + 1 + n].decode("ascii", "replace")
+    length = struct.unpack_from("<H", data, pos + 1)[0]
+    raw = data[pos + 4 : pos + length]
+    if kind == 0x90:
+        return raw.decode("utf-16-le", "replace")
+    return raw.decode("ascii", "replace")
+
+
+def _pdb_data_rows(data, page_len, first_page, last_page):
+    """Yield absolute row positions for every present row in a table's page chain."""
+    idx, seen = first_page, set()
+    while idx and idx not in seen:
+        seen.add(idx)
+        page = idx * page_len
+        if page + 40 > len(data):
+            break
+        next_page = struct.unpack_from("<I", data, page + 12)[0]
+        num_rows_small = data[page + 24]
+        page_flags = data[page + 27]
+        num_rows_large = struct.unpack_from("<H", data, page + 34)[0]
+        if (page_flags & 0x40) == 0:  # data page
+            num_rows = num_rows_small
+            if num_rows_large > num_rows_small and num_rows_large != 0x1FFF:
+                num_rows = num_rows_large
+            for i in range(num_rows):
+                group, j = divmod(i, 16)
+                base = page + page_len - group * 0x24
+                flags = struct.unpack_from("<H", data, base - 4)[0]
+                if not (flags >> j) & 1:
+                    continue
+                ofs = struct.unpack_from("<H", data, base - 6 - 2 * j)[0]
+                yield page + 0x28 + ofs
+        if idx == last_page:
+            break
+        idx = next_page
+
+
+def parse_rekordbox_pdb(pdb_path):
+    """Extract playlists (with folder paths) and track title/file-path from export.pdb."""
+    data = Path(pdb_path).read_bytes()
+    page_len = struct.unpack_from("<I", data, 4)[0]
+    num_tables = struct.unpack_from("<I", data, 8)[0]
+
+    tables = {}
+    for i in range(num_tables):
+        t, _empty, first, last = struct.unpack_from("<IIII", data, 28 + i * 16)
+        tables[t] = (first, last)
+
+    tracks = {}
+    if _PDB_TRACKS in tables:
+        for row in _pdb_data_rows(data, page_len, *tables[_PDB_TRACKS]):
+            track_id = struct.unpack_from("<I", data, row + 74)[0]
+            # 21 string-offset slots start at row+96; slot 17 = title, slot 20 = file path
+            ofs_title = struct.unpack_from("<H", data, row + 96 + 17 * 2)[0]
+            ofs_path = struct.unpack_from("<H", data, row + 96 + 20 * 2)[0]
+            duration = struct.unpack_from("<H", data, row + 86)[0]
+            path = _pdb_string(data, row + ofs_path)
+            if path:
+                tracks[track_id] = {"path": path, "title": _pdb_string(data, row + ofs_title),
+                                    "duration": duration}
+
+    nodes = {}
+    if _PDB_PLAYLIST_TREE in tables:
+        for row in _pdb_data_rows(data, page_len, *tables[_PDB_PLAYLIST_TREE]):
+            parent_id, _u, sort_order, node_id, raw_is_folder = struct.unpack_from("<IIIII", data, row)
+            nodes[node_id] = {"parent": parent_id, "sort": sort_order,
+                              "is_folder": raw_is_folder != 0,
+                              "name": _pdb_string(data, row + 20)}
+
+    entries = {}
+    if _PDB_PLAYLIST_ENTRIES in tables:
+        for row in _pdb_data_rows(data, page_len, *tables[_PDB_PLAYLIST_ENTRIES]):
+            entry_index, track_id, playlist_id = struct.unpack_from("<III", data, row)
+            entries.setdefault(playlist_id, []).append((entry_index, track_id))
+
+    def full_name(nid, depth=0):
+        n = nodes.get(nid)
+        if not n or depth > 10:
+            return ""
+        parent = full_name(n["parent"], depth + 1) if n["parent"] else ""
+        return f"{parent} > {n['name']}" if parent else n["name"]
+
+    playlists = []
+    for nid, n in sorted(nodes.items(), key=lambda kv: kv[1]["sort"]):
+        if n["is_folder"]:
+            continue
+        track_ids = [tid for _idx, tid in sorted(entries.get(nid, []))]
+        if track_ids:
+            playlists.append({"name": full_name(nid), "track_ids": track_ids})
+
+    return {"tracks": tracks, "playlists": playlists}
+
+
+# ── USB convert: make an existing Serato or rekordbox stick work in both ──
+
+def _parse_usb_serato_db_paths(usb_root):
+    """Existing database V2 pfil entries (USB-relative paths), if any."""
+    db_file = usb_root / "_Serato_" / "database V2"
+    if not db_file.exists():
+        return set()
+    data = db_file.read_bytes()
+    paths, i = set(), 0
+    while True:
+        idx = data.find(b"pfil", i)
+        if idx == -1:
+            break
+        ln = struct.unpack(">I", data[idx + 4 : idx + 8])[0]
+        try:
+            paths.add(data[idx + 8 : idx + 8 + ln].decode("utf-16-be").lstrip("/"))
+        except Exception:
+            pass
+        i = idx + 8 + ln
+    return paths
+
+
+def _rekordbox_usb_to_serato(usb_root, job):
+    """Read PIONEER/rekordbox/export.pdb and write Serato crates + database V2 for it."""
+    parsed = parse_rekordbox_pdb(usb_root / "PIONEER" / "rekordbox" / "export.pdb")
+    job["rb_playlists_found"] = len(parsed["playlists"])
+    written, all_rels = 0, set()
+    for pl in parsed["playlists"]:
+        rels = []
+        for tid in pl["track_ids"]:
+            t = parsed["tracks"].get(tid)
+            if not t:
+                continue
+            rel = t["path"].lstrip("/")
+            if (usb_root / rel).exists():
+                rels.append(rel)
+                all_rels.add(rel)
+        if rels:
+            _write_usb_crate(usb_root, pl["name"], rels)
+            written += 1
+        job["serato_crates_written"] = written
+
+    # database V2 must cover existing stick content too, or Serato drops those crates
+    all_rels |= _parse_usb_serato_db_paths(usb_root)
+    subcrates = usb_root / "_Serato_" / "Subcrates"
+    if subcrates.exists():
+        for f in subcrates.glob("*.crate"):
+            all_rels |= {p.lstrip("/") for p in parse_serato_crate(f)}
+    _write_usb_serato_database(usb_root, sorted(all_rels))
+    job["database_tracks"] = len(all_rels)
+
+
+def _serato_usb_to_rekordbox(usb_root, job):
+    """Read the stick's Serato crates and write rekordbox-import.xml next to them."""
+    meta_cache = {}
+
+    def stick_track(rel):
+        if rel in meta_cache:
+            return meta_cache[rel]
+        fp = usb_root / rel
+        if not fp.exists():
+            meta_cache[rel] = None
+            return None
+        t = {"path": str(fp), "title": fp.stem, "artist": "", "album": "", "genre": "",
+             "duration": 0, "file_size": 0}
+        try:
+            m = mutagen.File(str(fp), easy=True)
+            if m:
+                t["title"] = (m.get("title") or [fp.stem])[0]
+                t["artist"] = (m.get("artist") or [""])[0]
+                t["album"] = (m.get("album") or [""])[0]
+                t["genre"] = (m.get("genre") or [""])[0]
+                t["duration"] = m.info.length if m.info else 0
+            t["file_size"] = fp.stat().st_size
+        except Exception:
+            pass
+        meta_cache[rel] = t
+        return t
+
+    crates = []
+    crate_files = sorted((usb_root / "_Serato_" / "Subcrates").glob("*.crate"))
+    for f in crate_files:
+        tracks = []
+        for p in parse_serato_crate(f):
+            t = stick_track(p.lstrip("/"))
+            if t:
+                tracks.append(t)
+        if tracks:
+            crates.append({"name": f.stem.replace("%%", " > "), "tracks": tracks})
+        job["current"] = f.stem
+        job["xml_crates"] = len(crates)
+    if crates:
+        stats = _build_rekordbox_xml([{"name": None, "playlists": crates}],
+                                     usb_root / "rekordbox-import.xml")
+        job["xml_tracks"] = stats["tracks"]
+
+
+def _usb_convert_worker(job_id, usb_root):
+    job = _usb_jobs[job_id]
+    try:
+        did = []
+        if (usb_root / "PIONEER" / "rekordbox" / "export.pdb").exists():
+            job["status"] = "converting rekordbox → Serato crates"
+            _rekordbox_usb_to_serato(usb_root, job)
+            did.append("rekordbox→serato")
+        if (usb_root / "_Serato_" / "Subcrates").exists():
+            job["status"] = "writing rekordbox XML from Serato crates"
+            _serato_usb_to_rekordbox(usb_root, job)
+            did.append("serato→rekordbox")
+        if not did:
+            job["status"] = "error"
+            job["error"] = "No Serato (_Serato_/Subcrates) or rekordbox (PIONEER/rekordbox/export.pdb) data found on this drive"
+            return
+        job["ghosts_removed"] = _clean_appledouble(usb_root / "_Serato_")
+        job["converted"] = did
+        job["status"] = "done"
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)
+
+
+@app.route("/api/usb/convert", methods=["POST"])
+def usb_convert():
+    """Convert a plugged-in USB in place: a rekordbox stick gains Serato crates,
+    a Serato stick gains a rekordbox XML. Additive — existing data untouched."""
+    data = request.json or {}
+    volume = data.get("volume", "")
+    usb_root = Path(volume)
+    if not data.get("_test_dir") and (not volume.startswith("/Volumes/") or not os.path.ismount(volume)):
+        return jsonify({"error": "volume must be a mounted drive under /Volumes"}), 400
+    if not usb_root.exists() or not os.access(str(usb_root), os.W_OK):
+        return jsonify({"error": "volume not found or not writable"}), 400
+
+    job_id = hashlib.md5(f"cv{volume}{time.time()}".encode()).hexdigest()[:10]
+    with _usb_lock:
+        _usb_jobs[job_id] = {"id": job_id, "status": "starting", "volume": volume,
+                             "current": "", "error": None}
+    threading.Thread(target=_usb_convert_worker, args=(job_id, usb_root), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/usb")
+def usb_page():
+    return """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>USB Export — Amapiano</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0a0a;color:#eee;font-family:-apple-system,sans-serif;padding:20px;max-width:900px;margin:0 auto}
+h1{font-size:18px;margin-bottom:4px}
+.sub{color:#888;font-size:12px;margin-bottom:18px}
+a{color:#ff5500;text-decoration:none}
+select,input[type=text]{background:#1a1a1a;color:#eee;border:1px solid #333;border-radius:6px;padding:8px 10px;font-size:13px;width:100%}
+.row{display:flex;gap:10px;align-items:center;margin-bottom:14px}
+.cols{display:flex;gap:14px;flex-wrap:wrap}
+.col{flex:1;min-width:280px;background:#141414;border:1px solid #222;border-radius:8px;padding:12px}
+.col h3{font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;display:flex;justify-content:space-between}
+.col h3 span{cursor:pointer;color:#ff5500;font-size:11px;text-transform:none}
+.list{max-height:300px;overflow-y:auto;margin-top:8px}
+label.item{display:flex;gap:8px;align-items:center;padding:5px 4px;font-size:13px;cursor:pointer;border-radius:4px}
+label.item:hover{background:#1e1e1e}
+label.item .cnt{color:#666;font-size:11px;margin-left:auto}
+button.go{background:#ff5500;color:#fff;border:none;border-radius:8px;padding:12px 24px;font-size:14px;font-weight:700;cursor:pointer;margin-top:16px}
+button.go:disabled{background:#333;color:#777;cursor:default}
+button.mini{background:#1a1a1a;color:#ccc;border:1px solid #333;border-radius:6px;padding:8px 12px;font-size:12px;cursor:pointer}
+.bar{background:#1a1a1a;border-radius:6px;height:14px;overflow:hidden;margin:12px 0 6px}
+.bar div{background:#ff5500;height:100%;width:0%;transition:width .5s}
+#status{font-size:12px;color:#aaa;white-space:pre-line}
+.done{background:#10231a;border:1px solid #1f4a33;border-radius:8px;padding:14px;margin-top:14px;font-size:13px;line-height:1.6;display:none}
+.err{color:#ff6b6b}
+.vol-meta{font-size:11px;color:#666}
+</style></head><body>
+<h1>⇪ USB Export</h1>
+<div class="sub">Copies music onto the stick and writes Serato crates + database and a rekordbox XML — plug into any laptop with Serato or rekordbox. <a href="/">← back to library</a></div>
+
+<div class="row">
+  <select id="vol"></select>
+  <button class="mini" onclick="loadVols()">↻ Refresh</button>
+</div>
+<div class="vol-meta" id="volMeta"></div>
+
+<div class="cols" style="margin-top:14px">
+  <div class="col">
+    <h3>Playlists <span onclick="toggleAll('pl')">all / none</span></h3>
+    <input type="text" placeholder="filter..." oninput="filterList('pl',this.value)">
+    <div class="list" id="plList">loading…</div>
+  </div>
+  <div class="col">
+    <h3>Serato Crates <span onclick="toggleAll('cr')">all / none</span></h3>
+    <input type="text" placeholder="filter..." oninput="filterList('cr',this.value)">
+    <div class="list" id="crList">loading…</div>
+  </div>
+</div>
+
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+  <button class="go" id="goBtn" onclick="go()">Prepare USB</button>
+  <button class="go" id="convBtn" onclick="convertUsb()" style="background:#1a1a1a;border:1px solid #ff5500;color:#ff5500">⇄ Convert plugged-in USB</button>
+</div>
+<div class="sub" style="margin-top:8px">Convert = already-made stick: a rekordbox USB gains Serato crates, a Serato USB gains a rekordbox XML. Nothing is deleted or moved.</div>
+<div class="bar" id="barWrap" style="display:none"><div id="bar"></div></div>
+<div id="status"></div>
+<div class="done" id="doneBox"></div>
+
+<script>
+let vols=[];
+async function loadVols(){
+  const d=await (await fetch('/api/usb/volumes')).json();
+  vols=d.volumes;
+  const sel=document.getElementById('vol');
+  sel.innerHTML=vols.length?vols.map(v=>`<option value="${v.path}">${v.name} — ${(v.free_mb/1024).toFixed(1)} GB free${v.has_serato?' (has Serato)':''}</option>`).join(''):'<option value="">No USB drive found — plug one in and refresh</option>';
+  volMetaUpdate();
+}
+function volMetaUpdate(){
+  const v=vols.find(x=>x.path===document.getElementById('vol').value);
+  document.getElementById('volMeta').textContent=v?`${v.path} — ${(v.free_mb/1024).toFixed(1)} of ${(v.total_mb/1024).toFixed(1)} GB free`:'';
+}
+document.getElementById('vol').addEventListener('change',volMetaUpdate);
+async function loadLists(){
+  const pls=await (await fetch('/api/playlists')).json();
+  document.getElementById('plList').innerHTML=pls.playlists.map(p=>
+    `<label class="item" data-name="${p.name.toLowerCase()}"><input type="checkbox" class="pl" value="${p.id}">${p.name}<span class="cnt">${p.count}</span></label>`).join('')||'<div style="color:#555;font-size:12px">none</div>';
+  const crs=await (await fetch('/api/serato/crates')).json();
+  const live=crs.crates.filter(c=>c.source==='live'&&c.count>0);
+  document.getElementById('crList').innerHTML=live.map(c=>
+    `<label class="item" data-name="${c.name.toLowerCase()}"><input type="checkbox" class="cr" value="${c.name}">${c.name}<span class="cnt">${c.count}</span></label>`).join('')||'<div style="color:#555;font-size:12px">none</div>';
+}
+function filterList(cls,q){
+  const box=cls==='pl'?'plList':'crList';
+  document.querySelectorAll(`#${box} label.item`).forEach(l=>{
+    l.style.display=l.dataset.name.includes(q.toLowerCase())?'flex':'none';
+  });
+}
+function toggleAll(cls){
+  const boxes=[...document.querySelectorAll(`input.${cls}`)].filter(b=>b.closest('label').style.display!=='none');
+  const on=boxes.some(b=>!b.checked);
+  boxes.forEach(b=>b.checked=on);
+}
+async function go(){
+  const volume=document.getElementById('vol').value;
+  if(!volume){alert('Plug in a USB drive first');return}
+  const playlist_ids=[...document.querySelectorAll('input.pl:checked')].map(b=>b.value);
+  const crate_names=[...document.querySelectorAll('input.cr:checked')].map(b=>b.value);
+  if(!playlist_ids.length&&!crate_names.length){alert('Select at least one playlist or crate');return}
+  const btn=document.getElementById('goBtn');btn.disabled=true;btn.textContent='Preparing…';
+  document.getElementById('doneBox').style.display='none';
+  const r=await (await fetch('/api/usb/prepare',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({volume,playlist_ids,crate_names})})).json();
+  if(r.error){document.getElementById('status').innerHTML=`<span class="err">${r.error}</span>`;btn.disabled=false;btn.textContent='Prepare USB';return}
+  document.getElementById('barWrap').style.display='block';
+  poll(r.job_id);
+}
+async function poll(id){
+  const j=await (await fetch('/api/usb/jobs/'+id)).json();
+  const pct=j.bytes_total?Math.min(100,Math.round(j.bytes_done/j.bytes_total*100)):(j.status==='done'?100:0);
+  document.getElementById('bar').style.width=pct+'%';
+  const mb=x=>(x/1048576).toFixed(0);
+  document.getElementById('status').textContent=
+    `${j.status} — ${j.copied}/${j.total_files} files (${j.skipped} already on stick) — ${mb(j.bytes_done)}/${mb(j.bytes_total)} MB\\n${j.current||''}`;
+  if(j.status==='done'){
+    document.getElementById('bar').style.width='100%';
+    const btn=document.getElementById('goBtn');btn.disabled=false;btn.textContent='Prepare USB';
+    const box=document.getElementById('doneBox');box.style.display='block';
+    box.innerHTML=`<b>✓ USB ready</b> — ${j.copied} tracks, ${j.crates} crates, ${j.ghosts_removed} ghost files cleaned.<br>
+      <b>Serato:</b> eject, plug into any laptop — crates appear at the bottom of the crate panel under the drive name.<br>
+      <b>rekordbox:</b> on the laptop, Preferences &gt; Advanced &gt; Database &gt; rekordbox xml → select <code>rekordbox-import.xml</code> on the stick, enable View &gt; Layout &gt; rekordbox xml, import from sidebar.<br>
+      <span style="color:#888">Standalone CDJs need rekordbox's own "export to device" — do that from rekordbox after importing the xml.</span>`;
+    return;
+  }
+  if(j.status==='error'){
+    document.getElementById('status').innerHTML=`<span class="err">${j.error}</span>`;
+    const btn=document.getElementById('goBtn');btn.disabled=false;btn.textContent='Prepare USB';
+    return;
+  }
+  setTimeout(()=>poll(id),1500);
+}
+async function convertUsb(){
+  const volume=document.getElementById('vol').value;
+  if(!volume){alert('Plug in a USB drive first');return}
+  const btn=document.getElementById('convBtn');btn.disabled=true;btn.textContent='Converting…';
+  document.getElementById('doneBox').style.display='none';
+  const r=await (await fetch('/api/usb/convert',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({volume})})).json();
+  if(r.error){document.getElementById('status').innerHTML=`<span class="err">${r.error}</span>`;btn.disabled=false;btn.textContent='⇄ Convert plugged-in USB';return}
+  pollConvert(r.job_id);
+}
+async function pollConvert(id){
+  const j=await (await fetch('/api/usb/jobs/'+id)).json();
+  document.getElementById('status').textContent=`${j.status}${j.current?' — '+j.current:''}`;
+  const btn=document.getElementById('convBtn');
+  if(j.status==='done'){
+    btn.disabled=false;btn.textContent='⇄ Convert plugged-in USB';
+    const box=document.getElementById('doneBox');box.style.display='block';
+    let h=`<b>✓ USB converted</b> (${(j.converted||[]).join(', ')})<br>`;
+    if(j.serato_crates_written!==undefined)h+=`<b>Serato:</b> ${j.serato_crates_written} crates written from ${j.rb_playlists_found} rekordbox playlists, database V2 covers ${j.database_tracks} tracks — plug into Serato and the crates appear under the drive.<br>`;
+    if(j.xml_crates!==undefined)h+=`<b>rekordbox:</b> ${j.xml_crates} crates → rekordbox-import.xml (${j.xml_tracks||0} tracks) on the stick — point rekordbox prefs at that file to import.<br>`;
+    box.innerHTML=h;
+    return;
+  }
+  if(j.status==='error'){
+    document.getElementById('status').innerHTML=`<span class="err">${j.error}</span>`;
+    btn.disabled=false;btn.textContent='⇄ Convert plugged-in USB';
+    return;
+  }
+  setTimeout(()=>pollConvert(id),1500);
+}
+loadVols();loadLists();
+</script></body></html>"""
+
+
 # ── Downloads via spotdl ──
 
 import subprocess
@@ -854,7 +1847,12 @@ def _spotify_embed_info(spotify_url):
             entity = data["props"]["pageProps"]["state"]["data"]["entity"]
             name = entity["name"]
             artists = ", ".join(a["name"] for a in entity.get("artists", []))
-            duration_ms = entity.get("duration", {}).get("milliseconds", 0) or entity.get("duration_ms", 0)
+            # Spotify embed API: duration is raw int (ms) in new format, {"milliseconds": N} in old format
+            dur_field = entity.get("duration", 0)
+            if isinstance(dur_field, dict):
+                duration_ms = dur_field.get("milliseconds", 0)
+            else:
+                duration_ms = dur_field or entity.get("duration_ms", 0)
             return {"name": name, "artists": artists, "duration_s": duration_ms / 1000 if duration_ms else 0}
         # Fallback: regex
         m3 = _re.search(r'"name":"([^"]+)".*?"artists":\[.*?"name":"([^"]+)"', html)
@@ -955,8 +1953,11 @@ def _download_spotify_track_via_ytdlp(track_url, output_dir):
     return result, None
 
 
-def _run_download(download_id, url, playlist_name):
-    """Run download in background thread. Uses yt-dlp for most, spotdl for Spotify."""
+def _run_download(download_id, url, playlist_name, meta_name=None):
+    """Run download in background thread. Uses yt-dlp for most, spotdl for Spotify.
+    meta_name ("Artist - Title") forces a clean output filename for non-Spotify
+    URLs, same as the Spotify branch does with embed info — otherwise the
+    uploader name bleeds into the artist slot and wrecks Serato sorting."""
     safe_name = re.sub(r'[^\w\s\-]', '', playlist_name).strip() or "Downloads"
     output_dir = Path.home() / "Music" / "yt-dlp" / safe_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1005,17 +2006,67 @@ def _run_download(download_id, url, playlist_name):
                 result = r
             print(f"[spotify-single] done, rc={result.returncode}", flush=True)
         else:
-            # Use yt-dlp for SoundCloud, YouTube, etc
-            # Try real artist/track fields from metadata, fall back to title if missing
-            result = subprocess.run(
-                ["yt-dlp", "-x", "--audio-format", "mp3",
-                 "--audio-quality", "0",
-                 "-o", str(output_dir / "%(artist,creator,uploader)s - %(track,title)s.%(ext)s"),
-                 "--embed-metadata",
-                 "--no-playlist" if "/track" in url else "--yes-playlist",
-                 url],
-                capture_output=True, text=True, timeout=900
-            )
+            # Use yt-dlp for YouTube, etc
+            is_soundcloud = "soundcloud" in url.lower() or "on.soundcloud.com" in url.lower()
+
+            if is_soundcloud:
+                # NEVER hit SoundCloud servers — causes DataDome IP blocks.
+                # Extract track name from URL, search YouTube instead.
+                print(f"[soundcloud→youtube] Redirecting SoundCloud URL to YouTube search (protecting IP)", flush=True)
+                with _download_lock:
+                    _downloads[download_id].setdefault("warnings", [])
+                    _downloads[download_id]["warnings"].append("SoundCloud URL redirected to YouTube (IP protection)")
+
+                # Resolve short URLs (on.soundcloud.com) and extract artist/track from path
+                import re as _re
+                resolved_url = url
+                if "on.soundcloud.com" in url.lower():
+                    try:
+                        req = urllib.request.Request(url, method="HEAD",
+                            headers={"User-Agent": "Mozilla/5.0"})
+                        req.get_method = lambda: "HEAD"
+                        resp = urllib.request.urlopen(req, timeout=10)
+                        resolved_url = resp.url
+                    except Exception:
+                        pass
+
+                # Extract artist and track slug from soundcloud.com/artist/track-name
+                m = _re.search(r'soundcloud\.com/([^/]+)/([^/?]+)', resolved_url)
+                if m:
+                    artist_slug = m.group(1).replace("-", " ")
+                    track_slug = m.group(2).replace("-", " ")
+                    search_query = f"{artist_slug} {track_slug}"
+                else:
+                    search_query = resolved_url  # last resort
+
+                yt_out = str(output_dir / f"{search_query}.%(ext)s")
+                result = subprocess.run(
+                    ["yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "0",
+                     "-o", yt_out, "--no-playlist", "--embed-metadata",
+                     f"ytsearch1:{search_query} audio"],
+                    capture_output=True, text=True, timeout=120
+                )
+                if result.returncode == 0:
+                    print(f"[soundcloud→youtube] Downloaded via YouTube: {search_query}", flush=True)
+                else:
+                    print(f"[soundcloud→youtube] Failed: {result.stderr[:200]}", flush=True)
+            else:
+                if meta_name:
+                    safe_track = re.sub(r'[\\/:*?"<>|]', '', meta_name).strip()
+                    cmd = ["yt-dlp", "-x", "--audio-format", "mp3",
+                         "--audio-quality", "0",
+                         "-o", str(output_dir / f"{safe_track}.%(ext)s"),
+                         "--no-playlist", url]
+                else:
+                    cmd = ["yt-dlp", "-x", "--audio-format", "mp3",
+                         "--audio-quality", "0",
+                         "-o", str(output_dir / "%(artist,creator,uploader)s - %(track,title)s.%(ext)s"),
+                         "--embed-metadata",
+                         "--no-playlist" if "/track" in url else "--yes-playlist",
+                         url]
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=900
+                )
 
         # Scan new files in this playlist folder
         db = load_db()
@@ -1031,6 +2082,27 @@ def _run_download(download_id, url, playlist_name):
                     if track:
                         db["tracks"][fid] = track
                         new_tracks.append(fid)
+
+        # Reject preview/snippet files (under 35s — SoundCloud Go+ previews are ~30s)
+        MIN_TRACK_DURATION = 35
+        rejected = []
+        for fid in new_tracks[:]:
+            track = db["tracks"].get(fid)
+            if track and 0 < track.get("duration", 0) < MIN_TRACK_DURATION:
+                rejected.append(track)
+                new_tracks.remove(fid)
+                del db["tracks"][fid]
+                try:
+                    os.remove(track["path"])
+                    print(f"[preview-guard] Deleted preview: {track['artist']} - {track['title']} ({track['duration']}s)", flush=True)
+                except OSError:
+                    pass
+        if rejected:
+            names = [f"{t['artist']} - {t['title']} ({t['duration']}s)" for t in rejected]
+            with _download_lock:
+                _downloads[download_id].setdefault("warnings", [])
+                _downloads[download_id]["warnings"].append(
+                    f"Rejected {len(rejected)} preview(s) under {MIN_TRACK_DURATION}s: {'; '.join(names)}")
 
         # Create playlist from downloaded tracks if we got any
         if new_tracks and playlist_name:
@@ -1052,6 +2124,14 @@ def _run_download(download_id, url, playlist_name):
             _write_crate(playlist_name, [t["path"] for t in tracks])
 
         save_db(db)
+
+        # Keep rekordbox XML in sync with the library + Serato crates
+        if new_tracks:
+            try:
+                rb = _export_all_rekordbox()
+                print(f"[rekordbox] synced {rb['tracks']} tracks / {rb['playlists']} playlists -> {rb['path']}", flush=True)
+            except Exception as e:
+                print(f"[rekordbox] auto-export failed: {e}", flush=True)
 
         with _download_lock:
             _downloads[download_id]["status"] = "done"
@@ -1118,12 +2198,275 @@ def resolve_name():
     return jsonify({"name": name})
 
 
+# ── Sanitation endpoints ──
+_sanitize_jobs = {}
+_sanitize_lock = threading.Lock()
+
+
+@app.route("/api/sanitize/report")
+def sanitize_report():
+    """Library quality report: music videos, lyric videos, audio-only, short previews, low bitrate."""
+    db = load_db()
+    buckets = {
+        'music_video': [],
+        'live': [],
+        'lyric_video': [],
+        'audio_only': [],
+        'unknown': [],
+        'short_preview': [],  # < 35s = SoundCloud Go+ preview signature
+        'low_bitrate': [],    # < 128 kbps
+    }
+    for tid, t in db['tracks'].items():
+        duration = t.get('duration', 0)
+        if 0 < duration < 35:
+            buckets['short_preview'].append({'id': tid, 'artist': t['artist'], 'title': t['title'], 'duration': duration, 'path': t.get('path', '')})
+            continue
+        # Bitrate check
+        file_size = t.get('file_size', 0)
+        if file_size and duration > 0:
+            bitrate_kbps = (file_size * 8) / (duration * 1000)
+            if bitrate_kbps < 128:
+                buckets['low_bitrate'].append({'id': tid, 'artist': t['artist'], 'title': t['title'], 'duration': duration, 'bitrate_kbps': round(bitrate_kbps, 1)})
+        # Source classification
+        cls = sanitize_classify(t.get('title', ''))
+        buckets[cls].append({'id': tid, 'artist': t['artist'], 'title': t['title'], 'duration': duration})
+
+    counts = {k: len(v) for k, v in buckets.items()}
+    return jsonify({
+        'total_tracks': len(db['tracks']),
+        'counts': counts,
+        'buckets': buckets,
+        'quality_score': round(100 * counts['audio_only'] / max(1, len(db['tracks'])), 1),
+    })
+
+
+@app.route("/api/sanitize/classify/<track_id>")
+def sanitize_classify_one(track_id):
+    """Classify a single track's source."""
+    db = load_db()
+    t = db['tracks'].get(track_id)
+    if not t:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify({
+        'id': track_id,
+        'artist': t['artist'],
+        'title': t['title'],
+        'classification': sanitize_classify(t.get('title', '')),
+        'clean_title': sanitize_clean_title(t.get('title', '')),
+        'duration': t.get('duration', 0),
+    })
+
+
+def _sanitize_download_replacement(artist, title, output_dir, prefer_audio=True):
+    """Download audio replacement for a track. Tries audio → lyrics → bare search.
+    Returns (new_filepath, None) on success, (None, error_msg) on failure."""
+    clean_title = sanitize_clean_title(title)
+    attempts = []
+    if prefer_audio:
+        attempts.append(f"{artist} {clean_title} official audio")
+        attempts.append(f"{artist} {clean_title} audio")
+    attempts.append(f"{artist} {clean_title} lyrics")
+    attempts.append(f"{artist} {clean_title}")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r'[^\w\s\-\.]', '', f"{artist} - {clean_title}").strip()[:120]
+    output_template = str(output_dir / f"{safe}.%(ext)s")
+
+    for attempt in attempts:
+        result = subprocess.run(
+            ["yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "0",
+             "-o", output_template, "--no-playlist", "--embed-metadata",
+             f"ytsearch1:{attempt}"],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode != 0:
+            continue
+        # Find downloaded file
+        import glob as _glob
+        candidates = _glob.glob(str(output_dir / f"{safe}.*"))
+        if not candidates:
+            continue
+        newpath = candidates[0]
+        # Validate duration (must be > 60s, reject previews + broken files)
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", newpath],
+                capture_output=True, text=True, timeout=10
+            )
+            dur = float(probe.stdout.strip())
+            if dur < 60:
+                os.remove(newpath)
+                continue
+            return newpath, None
+        except (ValueError, FileNotFoundError):
+            try: os.remove(newpath)
+            except: pass
+            continue
+    return None, f"All YouTube search attempts failed for {artist} - {title}"
+
+
+@app.route("/api/sanitize/replace/<track_id>", methods=["POST"])
+def sanitize_replace(track_id):
+    """Replace a single track with an audio-only version from YouTube.
+    Deletes the old video/preview file, adds new track to DB."""
+    import subprocess as _sp
+    db = load_db()
+    track = db['tracks'].get(track_id)
+    if not track:
+        return jsonify({'error': 'track not found'}), 404
+
+    old_path = track.get('path', '')
+    if not old_path or not os.path.exists(old_path):
+        return jsonify({'error': 'old file missing'}), 404
+
+    output_dir = Path(old_path).parent
+    newpath, err = _sanitize_download_replacement(
+        track['artist'], track['title'], output_dir, prefer_audio=True
+    )
+    if err:
+        return jsonify({'error': err}), 500
+
+    # Delete old file if new one is at a different path
+    if newpath != old_path and os.path.exists(old_path):
+        try:
+            os.remove(old_path)
+        except OSError:
+            pass
+
+    # Re-index the new file
+    new_track = scan_track(newpath)
+    if not new_track:
+        return jsonify({'error': 'could not scan replacement'}), 500
+
+    # Replace old track in DB (preserving playlist membership if possible)
+    if track_id in db['tracks']:
+        del db['tracks'][track_id]
+    db['tracks'][new_track['id']] = new_track
+    # Update playlists that contained the old track ID
+    for pid, plist in db.get('playlists', {}).items():
+        ids = plist.get('track_ids', [])
+        if track_id in ids:
+            plist['track_ids'] = [new_track['id'] if i == track_id else i for i in ids]
+    save_db(db)
+
+    return jsonify({
+        'success': True,
+        'old': {'id': track_id, 'artist': track['artist'], 'title': track['title'], 'duration': track.get('duration', 0)},
+        'new': {'id': new_track['id'], 'artist': new_track['artist'], 'title': new_track['title'], 'duration': new_track['duration']},
+    })
+
+
+def _sanitize_fix_all_worker(job_id, target_classes, limit):
+    """Background worker that replaces all tracks matching target_classes."""
+    try:
+        db = load_db()
+        targets = []
+        for tid, t in db['tracks'].items():
+            duration = t.get('duration', 0)
+            if 'short_preview' in target_classes and 0 < duration < 35:
+                targets.append(tid)
+                continue
+            cls = sanitize_classify(t.get('title', ''))
+            if cls in target_classes:
+                targets.append(tid)
+        if limit and limit > 0:
+            targets = targets[:limit]
+
+        with _sanitize_lock:
+            _sanitize_jobs[job_id]['total'] = len(targets)
+            _sanitize_jobs[job_id]['status'] = 'running'
+
+        for i, tid in enumerate(targets):
+            with _sanitize_lock:
+                _sanitize_jobs[job_id]['progress'] = i
+            db = load_db()
+            track = db['tracks'].get(tid)
+            if not track:
+                continue
+            old_path = track.get('path', '')
+            if not old_path or not os.path.exists(old_path):
+                with _sanitize_lock:
+                    _sanitize_jobs[job_id]['skipped'].append(f"{track['artist']} - {track['title']} (file missing)")
+                continue
+            output_dir = Path(old_path).parent
+            newpath, err = _sanitize_download_replacement(
+                track['artist'], track['title'], output_dir, prefer_audio=True
+            )
+            if err:
+                with _sanitize_lock:
+                    _sanitize_jobs[job_id]['failed'].append(f"{track['artist']} - {track['title']}: {err[:80]}")
+                continue
+            if newpath != old_path and os.path.exists(old_path):
+                try: os.remove(old_path)
+                except OSError: pass
+            new_track = scan_track(newpath)
+            if new_track:
+                if tid in db['tracks']:
+                    del db['tracks'][tid]
+                db['tracks'][new_track['id']] = new_track
+                for pid, plist in db.get('playlists', {}).items():
+                    ids = plist.get('track_ids', [])
+                    if tid in ids:
+                        plist['track_ids'] = [new_track['id'] if i == tid else i for i in ids]
+                save_db(db)
+                with _sanitize_lock:
+                    _sanitize_jobs[job_id]['fixed'].append(f"{new_track['artist']} - {new_track['title']} ({new_track['duration']:.0f}s)")
+            time.sleep(0.5)
+
+        with _sanitize_lock:
+            _sanitize_jobs[job_id]['status'] = 'done'
+            _sanitize_jobs[job_id]['progress'] = len(targets)
+    except Exception as e:
+        with _sanitize_lock:
+            _sanitize_jobs[job_id]['status'] = 'error'
+            _sanitize_jobs[job_id]['error'] = str(e)
+
+
+@app.route("/api/sanitize/fix", methods=["POST"])
+def sanitize_fix_all():
+    """Start a background job replacing all targeted tracks."""
+    data = request.get_json() or {}
+    target_classes = data.get('classes', ['music_video', 'live', 'short_preview'])
+    limit = data.get('limit', 0)
+    job_id = hashlib.md5(f"sanitize{time.time()}".encode()).hexdigest()[:10]
+    with _sanitize_lock:
+        _sanitize_jobs[job_id] = {
+            'id': job_id, 'status': 'queued', 'total': 0, 'progress': 0,
+            'classes': target_classes, 'fixed': [], 'failed': [], 'skipped': []
+        }
+    thread = threading.Thread(
+        target=_sanitize_fix_all_worker,
+        args=(job_id, target_classes, limit),
+        daemon=True,
+    )
+    thread.start()
+    return jsonify({'job_id': job_id, 'status': 'queued', 'classes': target_classes})
+
+
+@app.route("/api/sanitize/jobs/<job_id>")
+def sanitize_job_status(job_id):
+    with _sanitize_lock:
+        job = _sanitize_jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'job not found'}), 404
+    return jsonify(job)
+
+
+@app.route("/api/sanitize/jobs")
+def sanitize_jobs_list():
+    with _sanitize_lock:
+        return jsonify({'jobs': list(_sanitize_jobs.values())})
+
+
 @app.route("/api/download", methods=["POST"])
 def start_download():
-    """Start a spotdl download. Accepts {url, name}."""
+    """Start a spotdl download. Accepts {url, name, meta_name}."""
     data = request.json
     url = data.get("url", "").strip()
     name = data.get("name", "").strip()
+    meta_name = (data.get("meta_name") or "").strip() or None
 
     # Auto-fetch playlist name if not provided
     if not name:
@@ -1157,7 +2500,7 @@ def start_download():
             "error": None,
         }
 
-    thread = threading.Thread(target=_run_download, args=(download_id, url, name))
+    thread = threading.Thread(target=_run_download, args=(download_id, url, name, meta_name))
     thread.daemon = True
     thread.start()
 
