@@ -1922,28 +1922,67 @@ def _download_spotify_track_via_ytdlp(track_url, output_dir):
     search_query = f"{info['artists']} - {info['name']}"
     expected_dur = info.get("duration_s", 0)
 
-    # Pre-check: get YouTube result duration BEFORE downloading
+    # Pick the OFFICIAL audio: prefer the label's "<Artist> - Topic" auto-upload (same master
+    # as Spotify), then the artist's own channel "Official Audio"; must be within 12% (min 12s)
+    # of Spotify's length. Falls back to the first length-matching result. (2026-08-26)
+    chosen_url = None
     if expected_dur > 0:
         try:
-            check = subprocess.run(
-                ["yt-dlp", "--print", "duration", "--no-playlist",
-                 f"ytsearch1:{search_query} audio"],
-                capture_output=True, text=True, timeout=30
+            r = subprocess.run(
+                ["yt-dlp", "--flat-playlist", "--print", "%(id)s\t%(duration)s\t%(channel)s\t%(title)s",
+                 f"ytsearch8:{info['artists'].split(',')[0].strip()} {info['name']} \"Provided to YouTube\""],
+                capture_output=True, text=True, timeout=60
             )
-            yt_dur = float(check.stdout.strip() or 0)
-            # Reject if YouTube result is >2x or <0.3x the expected duration
-            if yt_dur > 0 and (yt_dur > expected_dur * 2 or yt_dur < expected_dur * 0.3):
-                msg = f"Duration mismatch: expected {expected_dur:.0f}s, got {yt_dur:.0f}s — skipping"
+            slack = max(12.0, expected_dur * 0.12)
+            _n = lambda x: re.sub(r'[^a-z0-9]', '', (x or '').lower())
+            cands = []
+            for line in r.stdout.strip().splitlines():
+                parts = line.split("\t", 3)
+                if len(parts) < 4:
+                    continue
+                vid, d, ch, ti = parts
+                try:
+                    d = float(d)
+                except ValueError:
+                    continue
+                if abs(d - expected_dur) <= slack:
+                    cands.append((vid, d, ch, ti))
+            primary_artist = _n(info['artists'].split(',')[0])
+            # Label auto-upload = exact song title on the artist's channel (or "<x> - Topic"),
+            # confirmed by a description starting "Provided to YouTube by ..."
+            exact = [c for c in cands if _n(c[3]) == _n(info['name'])
+                     and (primary_artist in _n(c[2]) or c[2].endswith(' - Topic'))]
+            exact += [c for c in cands if c not in exact and c[2].endswith(' - Topic')]
+            best = None
+            for c in exact[:3]:
+                try:
+                    desc = subprocess.run(["yt-dlp", "--no-playlist", "--print", "%(description)s",
+                                           f"https://www.youtube.com/watch?v={c[0]}"],
+                                          capture_output=True, text=True, timeout=40).stdout
+                    if desc.lstrip().lower().startswith("provided to youtube"):
+                        best = c
+                        break
+                except Exception:
+                    pass
+            if not best:
+                official = [c for c in cands if primary_artist and primary_artist in _n(c[2])
+                            and not re.search(r'video|lyric|live|slowed|sped|remix|instrumental|clean', c[3], re.I)]
+                best = (official or cands or [None])[0]
+            if best:
+                chosen_url = f"https://www.youtube.com/watch?v={best[0]}"
+                print(f"[yt-dlp] pick {search_query}: {best[2]} | {best[3]} ({best[1]:.0f}s, expected {expected_dur:.0f}s)", flush=True)
+            else:
+                msg = f"No result within {slack:.0f}s of expected {expected_dur:.0f}s — skipping"
                 print(f"[yt-dlp] REJECTED {search_query}: {msg}", flush=True)
                 return None, msg
-        except Exception:
-            pass  # proceed anyway if check fails
+        except Exception as e:
+            print(f"[yt-dlp] search failed for {search_query}: {e}", flush=True)
 
     output_template = str(output_dir / f"{info['artists']} - {info['name']}.%(ext)s")
     result = subprocess.run(
         ["yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "0",
          "-o", output_template, "--no-playlist",
-         f"ytsearch1:{search_query} audio"],
+         chosen_url or f"ytsearch1:{search_query} audio"],
         capture_output=True, text=True, timeout=120
     )
     if result.returncode == 0:
@@ -2558,7 +2597,13 @@ def _startup_resync():
             synced += 1
         # Ensure Serato crate exists
         crate_path = SERATO_DIR / f"{folder.name}.crate"
-        if not crate_path.exists():
+        # Only create a crate if NO crate of that name exists at ANY nesting level —
+        # the user parents crates under genre folders (HIP HOP%%..., SETS%%...), and
+        # writing a flat copy for every folder duplicated ~230 crates on 2026-08-26.
+        _n = lambda x: re.sub(r'[^a-z0-9]', '', x.lower())
+        nested_exists = any(_n(p.stem.split('%%')[-1]) == _n(folder.name)
+                            for p in SERATO_DIR.glob("*%%*.crate"))
+        if not crate_path.exists() and not nested_exists:
             _write_crate(folder.name, [str(f) for f in sorted(files)])
             synced += 1
     if synced:
