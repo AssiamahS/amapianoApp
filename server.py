@@ -2597,12 +2597,25 @@ def _startup_resync():
             synced += 1
         # Ensure Serato crate exists
         crate_path = SERATO_DIR / f"{folder.name}.crate"
+        # Never resurrect a crate the user trashed (visualSerato trash keeps
+        # "<ts>-<name>.crate"), and never mint crates for yt-dlp date batches
+        # ("Download Apr 4 at 105 AM") — those are download buckets, not crates.
+        if re.match(r"^Download \w+ \d+ at ", folder.name):
+            continue
+        _n = lambda x: re.sub(r'[^a-z0-9]', '', x.lower())
+        _leaf = lambda stem: stem.split("%%")[-1]
+        _trash = SERATO_DIR / "_visualserato_trash"
+        if _trash.exists() and any(
+                t.suffix == ".crate" and _n(_leaf(re.sub(r"^\d+-", "", t.stem))) == _n(folder.name)
+                for t in _trash.iterdir()):
+            continue
         # Only create a crate if NO crate of that name exists at ANY nesting level —
         # the user parents crates under genre folders (HIP HOP%%..., SETS%%...), and
         # writing a flat copy for every folder duplicated ~230 crates on 2026-08-26.
-        _n = lambda x: re.sub(r'[^a-z0-9]', '', x.lower())
-        nested_exists = any(_n(p.stem.split('%%')[-1]) == _n(folder.name)
-                            for p in SERATO_DIR.glob("*%%*.crate"))
+        # ...and match top-level crates too, by normalized leaf, so "A & B" vs "A  B"
+        # folder/crate spellings don't spawn a second crate.
+        nested_exists = any(_n(_leaf(p.stem)) == _n(folder.name)
+                            for p in SERATO_DIR.glob("*.crate"))
         if not crate_path.exists() and not nested_exists:
             _write_crate(folder.name, [str(f) for f in sorted(files)])
             synced += 1
